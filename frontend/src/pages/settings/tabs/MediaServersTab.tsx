@@ -27,6 +27,7 @@ import {
   usePlexDvrs,
 } from "@/hooks/useSettings"
 import type { ChannelsDVRServer, ChannelsDVRSettings, EmbySettings, JellyfinSettings, MediaServerEntry, PlexServer, PlexSettings } from "@/api/settings"
+import { useChannelProfiles } from "@/hooks/useDispatcharr"
 
 interface TestResult {
   success: boolean
@@ -600,6 +601,7 @@ const EMPTY_PLEX_SERVER: PlexServer = {
   token: null,
   dvr_id: null,
   device_key: null,
+  channel_profile_id: null,
 }
 
 interface PlexServerRowProps {
@@ -614,6 +616,7 @@ function PlexServerRow({ index, server, onChange, onRemove, removable }: PlexSer
   const testPlex = useTestPlexConnection()
   const [testResult, setTestResult] = useState<TestResult | null>(null)
   const { data: dvrsData, isFetching: dvrsLoading } = usePlexDvrs(server.url, server.token)
+  const { data: channelProfiles = [] } = useChannelProfiles()
 
   const idPrefix = `plex-${index}`
   const noUrl = !server.url
@@ -739,7 +742,17 @@ function PlexServerRow({ index, server, onChange, onRemove, removable }: PlexSer
                 value={selectedValue}
                 onChange={(e) => {
                   const [dvrId, deviceKey] = e.target.value.split("::")
-                  onChange({ ...server, dvr_id: dvrId || null, device_key: deviceKey || null })
+                  const picked = devices.find((d) => d.dvr.key === dvrId && d.device.key === deviceKey)
+                  const hint = picked?.device.profile_hint
+                  const matchedProfile = hint
+                    ? channelProfiles.find((p) => p.name.toLowerCase() === hint.toLowerCase())
+                    : undefined
+                  onChange({
+                    ...server,
+                    dvr_id: dvrId || null,
+                    device_key: deviceKey || null,
+                    channel_profile_id: matchedProfile ? matchedProfile.id : server.channel_profile_id,
+                  })
                 }}
                 disabled={noUrl || noToken || dvrsLoading}
               >
@@ -773,6 +786,32 @@ function PlexServerRow({ index, server, onChange, onRemove, removable }: PlexSer
             </>
           )
         })()}
+      </div>
+
+      {/* Dispatcharr channel profile (scopes which channels get pushed to this device) */}
+      <div className="space-y-2">
+        <Label htmlFor={`${idPrefix}-profile`}>Dispatcharr Channel Profile</Label>
+        <Select
+          id={`${idPrefix}-profile`}
+          value={server.channel_profile_id != null ? String(server.channel_profile_id) : ""}
+          onChange={(e) => {
+            const raw = e.target.value
+            const profile = channelProfiles.find((p) => String(p.id) === raw)
+            onChange({ ...server, channel_profile_id: profile ? profile.id : null })
+          }}
+        >
+          <option value="">— Unscoped (all Teamarr channels) —</option>
+          {channelProfiles.map((profile) => (
+            <option key={profile.id} value={String(profile.id)}>
+              {profile.name}
+            </option>
+          ))}
+        </Select>
+        <p className="text-xs text-muted-foreground">
+          If this device's HDHomeRun URI is scoped to one Dispatcharr profile, pick the
+          matching profile so only that profile's channels are pushed to it — otherwise
+          leave unscoped.
+        </p>
       </div>
     </div>
   )

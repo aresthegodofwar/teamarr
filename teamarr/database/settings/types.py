@@ -379,6 +379,11 @@ class PlexServer:
     `dvr_id`/`device_key` identify the matched DVR + HDHomeRun device
     (Settings → Plex discovers these from `GET /livetv/dvrs`); both must
     be set before a refresh runs for this server.
+
+    `channel_profile_id` scopes which of Teamarr's managed channels get
+    pushed to this device — needed when the device's HDHomeRun URI is
+    itself scoped to one Dispatcharr channel profile (see `profile_hint`
+    on `PlexDevice`); `None` means unscoped (every managed channel).
     """
 
     name: str = ""
@@ -386,6 +391,7 @@ class PlexServer:
     token: str | None = None
     dvr_id: str | None = None
     device_key: str | None = None
+    channel_profile_id: int | str | None = None
 
 
 @dataclass

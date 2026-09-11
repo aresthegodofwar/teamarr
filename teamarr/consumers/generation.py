@@ -4,6 +4,7 @@ This module provides the single source of truth for EPG generation.
 Both the streaming API endpoint and the background scheduler call this.
 """
 
+import json
 import logging
 import threading
 import time
@@ -486,11 +487,7 @@ def run_full_generation(
             if channelsdvr_settings.enabled:
                 jobs += [("channelsdvr", s) for s in channelsdvr_settings.servers if s.url]
             if plex_settings.enabled:
-                jobs += [
-                    ("plex", s)
-                    for s in plex_settings.servers
-                    if s.url and s.token and s.dvr_id and s.device_key
-                ]
+                jobs += [("plex", s) for s in plex_settings.servers if s.url]
 
             if jobs and _dry_run_media_refresh(result, jobs):
                 jobs = []
@@ -803,6 +800,7 @@ def _refresh_one_media_server(
             label,
             db_factory,
             lambda msg: update_progress("plex", 97, f"{msg} ({label})"),
+            is_cancellation_requested,
         )
         return {"guide": guide_res}
 
@@ -942,11 +940,30 @@ def _refresh_channelsdvr_server(
     return m3u_result, epg_result
 
 
+def _channel_in_profile(raw_profile_ids: str | None, profile_id: int | str) -> bool:
+    """Check a managed_channels row's ``channel_profile_ids`` against one profile.
+
+    Mirrors the read-back parsing in ``reconciliation.py`` (JSON TEXT column,
+    empty/invalid -> no profiles). ``0`` is Dispatcharr's ALL-profiles
+    sentinel (see ``creator.py``'s ``[0]`` default) and always matches.
+    """
+    if not raw_profile_ids:
+        return False
+    try:
+        ids = json.loads(raw_profile_ids)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(ids, list):
+        return False
+    return 0 in ids or profile_id in ids or str(profile_id) in {str(i) for i in ids}
+
+
 def _refresh_plex_server(
     server: Any,
     label: str,
     db_factory: Callable[[], Any],
     progress: Callable[[str], None],
+    is_cancellation_requested: Callable[[], bool],
 ) -> dict:
     """Reload one Plex server's guide, then push Teamarr's current channels.
 
@@ -957,12 +974,26 @@ def _refresh_plex_server(
     entries sharing the device), and set the full desired list — Plex's
     channelmap endpoint is a full-state-replace, never a delta.
 
-    Requires dvr_id + device_key already selected in Settings; callers
-    filter those servers into the job list before this runs.
+    Callers only filter on `server.url` (matching Emby/Jellyfin/Channels DVR);
+    a missing dvr_id/device_key is reported here as a visible failure rather
+    than silently dropped from the job list.
     """
-    from teamarr.database.settings import get_lifecycle_settings
+    from teamarr.database.channel_numbers import get_global_channel_range
+
+    if not server.token:
+        return {"success": False, "error": "No Plex token configured"}
+    if not server.dvr_id or not server.device_key:
+        return {"success": False, "error": "No DVR/device selected in Settings"}
+
+    def cancelled() -> dict | None:
+        if is_cancellation_requested():
+            return {"success": False, "error": "Cancelled"}
+        return None
 
     client = PlexClient(base_url=server.url, token=server.token or "")
+
+    if result := cancelled():
+        return result
 
     progress("Reloading Plex guide...")
     guide_result = client.reload_guide(server.dvr_id)
@@ -970,6 +1001,9 @@ def _refresh_plex_server(
         logger.warning("[PLEX] %s: guide reload failed: %s", label, guide_result.get("error"))
         return guide_result
     logger.info("[PLEX] %s: guide reload triggered", label)
+
+    if result := cancelled():
+        return result
 
     dvrs_result = client.list_dvrs()
     if not dvrs_result.get("success"):
@@ -990,24 +1024,40 @@ def _refresh_plex_server(
         )
         return {"success": False, "error": "Configured device not found"}
 
+    if result := cancelled():
+        return result
+
     with db_factory() as conn:
-        lifecycle = get_lifecycle_settings(conn)
+        channel_range = get_global_channel_range(conn)
         rows = conn.execute(
-            """SELECT channel_number FROM managed_channels
+            """SELECT channel_number, channel_profile_ids FROM managed_channels
                WHERE deleted_at IS NULL AND channel_number IS NOT NULL"""
         ).fetchall()
 
+    profile_id = server.channel_profile_id
+    if profile_id is None:
+        logger.warning(
+            "[PLEX] %s: no Dispatcharr channel profile selected — pushing every "
+            "Teamarr-managed channel to this device regardless of profile scope",
+            label,
+        )
+
     teamarr_keys: set[str] = set()
     for row in rows:
+        row_profiles = row["channel_profile_ids"]
+        if profile_id is not None and not _channel_in_profile(row_profiles, profile_id):
+            continue
         try:
             teamarr_keys.add(str(int(float(row["channel_number"]))))
         except (TypeError, ValueError):
             continue
 
-    channel_range = (lifecycle.channel_range_start, lifecycle.channel_range_end)
     enabled, mapping = compute_channelmap_update(
         device.channel_mapping, teamarr_keys, channel_range
     )
+
+    if result := cancelled():
+        return result
 
     progress("Updating Plex channel map...")
     map_result = client.update_channelmap(device.key, enabled, mapping)

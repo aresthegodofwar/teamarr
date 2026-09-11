@@ -319,6 +319,7 @@ export interface PlexServer {
   token: string | null
   dvr_id: string | null
   device_key: string | null
+  channel_profile_id: number | string | null
 }
 
 export interface PlexSettings {
@@ -705,11 +706,7 @@ export async function testPlexConnection(data?: { url?: string; token?: string }
 }
 
 export async function getPlexDvrs(url?: string, token?: string): Promise<PlexDvrsResponse> {
-  const params = new URLSearchParams()
-  if (url) params.set("url", url)
-  if (token) params.set("token", token)
-  const qs = params.toString() ? `?${params.toString()}` : ""
-  return api.get(`/plex/dvrs${qs}`)
+  return api.post("/plex/dvrs", { url, token })
 }
 
 // Provider Proxy Settings API

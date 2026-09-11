@@ -23,6 +23,7 @@ fetch-merge-write cycle.
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -74,6 +75,19 @@ class PlexDvr:
     devices: list[PlexDevice] = field(default_factory=list)
 
 
+def _as_list(value: Any) -> list:
+    """Normalize a Plex JSON container that may collapse to a bare object.
+
+    Plex-style APIs are known to return a single-child container as one
+    object instead of a 1-element array (e.g. one DVR, one device, one
+    channel mapping) — unverified here against a live server, but cheap
+    to guard against regardless.
+    """
+    if isinstance(value, dict):
+        return [value]
+    return list(value) if value else []
+
+
 def _channel_sort_key(channel_key: str) -> tuple[int, object]:
     try:
         return (0, int(float(channel_key)))
@@ -120,15 +134,13 @@ def compute_channelmap_update(
 
     preserved = [m for m in current if m.enabled and not _owned_by_teamarr(m.channel_key)]
 
-    enabled_keys = {m.channel_key for m in preserved} | set(teamarr_channel_keys)
-    enabled = sorted(enabled_keys, key=_channel_sort_key)
-
     mapping: dict[str, str] = {
         m.channel_key: m.lineup_identifier or m.channel_key for m in preserved
     }
     for key in teamarr_channel_keys:
         mapping[key] = key
 
+    enabled = sorted(mapping, key=_channel_sort_key)
     return enabled, mapping
 
 
@@ -164,9 +176,9 @@ class PlexClient:
 
         container = (data or {}).get("MediaContainer") or {}
         dvrs: list[PlexDvr] = []
-        for dvr in container.get("Dvr") or []:
+        for dvr in _as_list(container.get("Dvr")):
             devices: list[PlexDevice] = []
-            for dev in dvr.get("Device") or []:
+            for dev in _as_list(dvr.get("Device")):
                 mapping = [
                     PlexChannelMapping(
                         channel_key=str(m.get("channelKey")),
@@ -174,7 +186,7 @@ class PlexClient:
                         lineup_identifier=m.get("lineupIdentifier"),
                         device_identifier=m.get("deviceIdentifier"),
                     )
-                    for m in dev.get("ChannelMapping") or []
+                    for m in _as_list(dev.get("ChannelMapping"))
                 ]
                 devices.append(
                     PlexDevice(

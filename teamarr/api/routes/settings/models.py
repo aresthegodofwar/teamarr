@@ -669,6 +669,7 @@ class PlexServerModel(BaseModel):
     token: str | None = None
     dvr_id: str | None = None
     device_key: str | None = None
+    channel_profile_id: int | str | None = None
 
     @field_serializer("token")
     @classmethod
@@ -689,6 +690,7 @@ class PlexServerUpdateModel(BaseModel):
     token: str | None = None
     dvr_id: str | None = None
     device_key: str | None = None
+    channel_profile_id: int | str | None = None
 
 
 class PlexSettingsModel(BaseModel):

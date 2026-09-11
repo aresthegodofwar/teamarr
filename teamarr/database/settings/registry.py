@@ -328,6 +328,7 @@ def _parse_plex_servers(raw: Any) -> list:
             token=entry.get("token"),
             dvr_id=entry.get("dvr_id"),
             device_key=entry.get("device_key"),
+            channel_profile_id=entry.get("channel_profile_id"),
         )
         for entry in data
         if isinstance(entry, dict)
