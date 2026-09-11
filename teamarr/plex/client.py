@@ -17,8 +17,17 @@ each Teamarr generation:
 Both endpoints require ``X-Plex-Token`` (sent as a header here) — no other
 auth scheme. ``GET /livetv/dvrs`` is the read side: it returns every DVR and
 its attached HDHomeRun devices, each carrying its current ``ChannelMapping``
-(channelKey/enabled/lineupIdentifier) — the fetch half of the
-fetch-merge-write cycle.
+(channelKey/enabled/lineupIdentifier/deviceIdentifier) — the fetch half of
+the fetch-merge-write cycle.
+
+Verified against a live server (2026-09): ``deviceIdentifier`` is the
+stable Dispatcharr/HDHomeRun physical channel number and never changes.
+``channelKey`` is whatever EPG entry is *currently matched* in Plex's
+Channel Matching UI — it starts out equal to ``deviceIdentifier`` but
+diverges the moment that match is changed (manually, or by Plex's own
+auto-matching). Everything here keys on ``deviceIdentifier``; ``channelKey``
+is kept only for display/debugging and must never drive an ownership or
+identity decision.
 """
 
 import logging
@@ -33,12 +42,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PlexChannelMapping:
-    """One tuner-channel entry on a Plex DVR device."""
+    """One tuner-channel entry on a Plex DVR device.
 
-    channel_key: str
+    ``device_identifier`` is the stable Dispatcharr/HDHomeRun physical
+    channel number — the identity everything is keyed on. ``channel_key``
+    is Plex's currently-matched EPG guide channel (mutable, display-only —
+    never use it for ownership/identity, see module docstring).
+    ``lineup_identifier`` is the EPG binding to preserve for a foreign
+    channel that isn't Teamarr's own.
+    """
+
+    device_identifier: str
     enabled: bool
     lineup_identifier: str | None = None
-    device_identifier: str | None = None
+    channel_key: str | None = None
 
 
 @dataclass
@@ -112,6 +129,13 @@ def compute_channelmap_update(
     (nothing is preserved-vs-owned in that case — every enabled channel
     is treated as foreign).
 
+    Everything is keyed on ``device_identifier`` (the stable Dispatcharr
+    physical channel number), never ``channel_key`` (Plex's mutable,
+    currently-matched EPG guide channel — see module docstring). A
+    preserved foreign channel's value is its own current
+    ``lineup_identifier``, so an existing (possibly non-default) EPG
+    binding is carried forward untouched rather than overwritten.
+
     Returns ``(enabled_channel_keys, channel_mapping)`` ready for
     ``PlexClient.update_channelmap``. Teamarr's own channels map to
     themselves (``channel_mapping[key] == key``) — correct as long as
@@ -120,22 +144,24 @@ def compute_channelmap_update(
     prerequisite.
     """
 
-    def _owned_by_teamarr(channel_key: str) -> bool:
+    def _owned_by_teamarr(device_identifier: str) -> bool:
         if teamarr_range is None:
             return False
         start, end = teamarr_range
         try:
-            number = int(float(channel_key))
+            number = int(float(device_identifier))
         except (TypeError, ValueError):
             return False
         if end is None:
             return number >= start
         return start <= number <= end
 
-    preserved = [m for m in current if m.enabled and not _owned_by_teamarr(m.channel_key)]
+    preserved = [
+        m for m in current if m.enabled and not _owned_by_teamarr(m.device_identifier)
+    ]
 
     mapping: dict[str, str] = {
-        m.channel_key: m.lineup_identifier or m.channel_key for m in preserved
+        m.device_identifier: m.lineup_identifier or m.device_identifier for m in preserved
     }
     for key in teamarr_channel_keys:
         mapping[key] = key
@@ -181,10 +207,12 @@ class PlexClient:
             for dev in _as_list(dvr.get("Device")):
                 mapping = [
                     PlexChannelMapping(
-                        channel_key=str(m.get("channelKey")),
+                        device_identifier=str(m.get("deviceIdentifier")),
                         enabled=str(m.get("enabled")) == "1",
                         lineup_identifier=m.get("lineupIdentifier"),
-                        device_identifier=m.get("deviceIdentifier"),
+                        channel_key=(
+                            str(m.get("channelKey")) if m.get("channelKey") is not None else None
+                        ),
                     )
                     for m in _as_list(dev.get("ChannelMapping"))
                 ]
@@ -241,13 +269,18 @@ class PlexClient:
 
         Full-state-replace: ``enabled_channel_keys`` must be the COMPLETE
         desired enabled set (see ``compute_channelmap_update``), not a delta.
+        Both `channelMappingByKey` and `channelMapping` are keyed by the
+        physical channel (device identifier) and carry the same resolved
+        EPG-binding value — previously `channelMappingByKey` always sent
+        the key back as its own value regardless of `channel_mapping`,
+        which disagreed with `channelMapping` for a preserved foreign
+        channel whose EPG binding differs from its channel number.
         """
         params: list[tuple[str, str]] = [
             ("channelsEnabled", ",".join(enabled_channel_keys)),
         ]
-        for key in enabled_channel_keys:
-            params.append((f"channelMappingByKey[{key}]", key))
         for key, value in channel_mapping.items():
+            params.append((f"channelMappingByKey[{key}]", value))
             params.append((f"channelMapping[{key}]", value))
 
         try:

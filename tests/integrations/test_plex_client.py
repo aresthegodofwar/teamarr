@@ -5,6 +5,11 @@ complete enabled-channel set, never a delta), so `compute_channelmap_update`
 is the safety-critical part of this integration: it must never drop a
 channel that isn't Teamarr's own. These tests pin that contract, plus URL
 building and HTTP method/param handling.
+
+Everything is keyed on `device_identifier` (the stable Dispatcharr/
+HDHomeRun physical channel number), never `channel_key` (Plex's mutable,
+currently-matched EPG guide channel — verified against a live server to
+diverge from the physical channel after a manual Channel Matching remap).
 """
 
 import httpx
@@ -57,11 +62,13 @@ class TestListDvrsHTTP:
                                     "ChannelMapping": [
                                         {
                                             "channelKey": "301",
+                                            "deviceIdentifier": "301",
                                             "enabled": "1",
                                             "lineupIdentifier": "301",
                                         },
                                         {
                                             "channelKey": "60",
+                                            "deviceIdentifier": "60",
                                             "enabled": "0",
                                             "lineupIdentifier": "60",
                                         },
@@ -88,6 +95,48 @@ class TestListDvrsHTTP:
         assert len(device.channel_mapping) == 2
         assert device.channel_mapping[0].enabled is True
         assert device.channel_mapping[1].enabled is False
+
+    def test_channel_key_and_device_identifier_can_diverge(self, monkeypatch):
+        """Pins the live-server finding: a Plex Channel Matching remap moves
+        `channelKey` to track the newly-matched EPG entry while
+        `deviceIdentifier` stays fixed at the physical channel. Teamarr must
+        key on `deviceIdentifier`, never `channelKey`."""
+
+        def fake_get(url, **kwargs):
+            req = httpx.Request("GET", url)
+            body = {
+                "MediaContainer": {
+                    "Dvr": [
+                        {
+                            "key": "55",
+                            "Device": [
+                                {
+                                    "key": "54",
+                                    "ChannelMapping": [
+                                        {
+                                            "channelKey": "101",
+                                            "deviceIdentifier": "700",
+                                            "enabled": "1",
+                                            "lineupIdentifier": "101",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+            return httpx.Response(200, json=body, request=req)
+
+        monkeypatch.setattr(httpx, "get", fake_get)
+
+        client = PlexClient(base_url="http://plex:32400", token="abc")
+        result = client.list_dvrs()
+
+        m = result["dvrs"][0].devices[0].channel_mapping[0]
+        assert m.device_identifier == "700"
+        assert m.channel_key == "101"
+        assert m.lineup_identifier == "101"
 
     def test_401_returns_invalid_token_error(self, monkeypatch):
         def fake_get(url, **kwargs):
@@ -147,14 +196,35 @@ class TestUpdateChannelmap:
         assert params["channelMapping[60]"] == "60"
         assert params["channelMapping[301]"] == "301"
 
+    def test_channel_mapping_by_key_matches_resolved_value_not_identity(self, monkeypatch):
+        """A preserved foreign channel's EPG binding can differ from its
+        channel number — both params must agree on the real value, not
+        silently disagree (previously channelMappingByKey always sent the
+        key back as its own value)."""
+        captured = {}
+
+        def fake_put(url, **kwargs):
+            captured["params"] = kwargs["params"]
+            req = httpx.Request("PUT", url)
+            return httpx.Response(200, request=req)
+
+        monkeypatch.setattr(httpx, "put", fake_put)
+
+        client = PlexClient(base_url="http://plex:32400", token="abc")
+        client.update_channelmap("54", ["700"], {"700": "101"})
+
+        params = dict(captured["params"])
+        assert params["channelMappingByKey[700]"] == "101"
+        assert params["channelMapping[700]"] == "101"
+
 
 class TestComputeChannelmapUpdate:
     """The fetch-merge-write core — must never drop non-Teamarr channels."""
 
     def test_preserves_channels_outside_teamarr_range(self):
         current = [
-            PlexChannelMapping(channel_key="60", enabled=True, lineup_identifier="60"),
-            PlexChannelMapping(channel_key="90", enabled=True, lineup_identifier="90"),
+            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
+            PlexChannelMapping(device_identifier="90", enabled=True, lineup_identifier="90"),
         ]
         enabled, mapping = compute_channelmap_update(
             current, teamarr_channel_keys={"101", "102"}, teamarr_range=(101, 200)
@@ -168,7 +238,7 @@ class TestComputeChannelmapUpdate:
 
     def test_disabled_non_teamarr_channels_stay_disabled(self):
         current = [
-            PlexChannelMapping(channel_key="60", enabled=False, lineup_identifier="60"),
+            PlexChannelMapping(device_identifier="60", enabled=False, lineup_identifier="60"),
         ]
         enabled, _ = compute_channelmap_update(
             current, teamarr_channel_keys=set(), teamarr_range=(101, 200)
@@ -180,7 +250,7 @@ class TestComputeChannelmapUpdate:
         it's still enabled in Plex's last-known state — the caller passes
         only currently-active channel numbers."""
         current = [
-            PlexChannelMapping(channel_key="101", enabled=True, lineup_identifier="101"),
+            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
         ]
         enabled, mapping = compute_channelmap_update(
             current, teamarr_channel_keys={"102"}, teamarr_range=(101, 200)
@@ -195,7 +265,7 @@ class TestComputeChannelmapUpdate:
         (defensive default) — every enabled channel from another tool is
         still preserved since none are (falsely) claimed as Teamarr range."""
         current = [
-            PlexChannelMapping(channel_key="5", enabled=True, lineup_identifier="5"),
+            PlexChannelMapping(device_identifier="5", enabled=True, lineup_identifier="5"),
         ]
         enabled, mapping = compute_channelmap_update(
             current, teamarr_channel_keys={"101"}, teamarr_range=None
@@ -205,8 +275,8 @@ class TestComputeChannelmapUpdate:
 
     def test_unbounded_range_end_none(self):
         current = [
-            PlexChannelMapping(channel_key="50", enabled=True, lineup_identifier="50"),
-            PlexChannelMapping(channel_key="150", enabled=True, lineup_identifier="150"),
+            PlexChannelMapping(device_identifier="50", enabled=True, lineup_identifier="50"),
+            PlexChannelMapping(device_identifier="150", enabled=True, lineup_identifier="150"),
         ]
         enabled, _ = compute_channelmap_update(
             current, teamarr_channel_keys={"200"}, teamarr_range=(101, None)
@@ -217,12 +287,27 @@ class TestComputeChannelmapUpdate:
 
     def test_non_numeric_channel_key_is_never_treated_as_owned(self):
         current = [
-            PlexChannelMapping(channel_key="abc", enabled=True, lineup_identifier="abc"),
+            PlexChannelMapping(device_identifier="abc", enabled=True, lineup_identifier="abc"),
         ]
         enabled, _ = compute_channelmap_update(
             current, teamarr_channel_keys=set(), teamarr_range=(101, 200)
         )
         assert enabled == ["abc"]
+
+    def test_preserved_channel_keeps_its_own_epg_binding(self):
+        """A foreign channel's EPG match may differ from its channel number
+        (Plex's Channel Matching UI allows remapping) — the preserved
+        mapping must carry that real binding forward, not force identity."""
+        current = [
+            PlexChannelMapping(
+                device_identifier="700", enabled=True, lineup_identifier="101"
+            ),
+        ]
+        enabled, mapping = compute_channelmap_update(
+            current, teamarr_channel_keys=set(), teamarr_range=(101, 200)
+        )
+        assert enabled == ["700"]
+        assert mapping["700"] == "101"
 
     @pytest.mark.parametrize("range_", [(101, 200), (101, None), None])
     def test_never_raises_on_empty_current(self, range_):
