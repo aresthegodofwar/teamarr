@@ -373,6 +373,33 @@ class ChannelsDVRSettings:
 
 
 @dataclass
+class PlexServer:
+    """One Plex Media Server target for post-generation Live TV refresh.
+
+    `dvr_id`/`device_key` identify the matched DVR + HDHomeRun device
+    (Settings → Plex discovers these from `GET /livetv/dvrs`); both must
+    be set before a refresh runs for this server.
+    """
+
+    name: str = ""
+    url: str | None = None
+    token: str | None = None
+    dvr_id: str | None = None
+    device_key: str | None = None
+
+
+@dataclass
+class PlexSettings:
+    """Plex integration settings for Live TV guide + channel-map refresh.
+
+    Multi-server: refresh fans out over every entry in `servers`.
+    """
+
+    enabled: bool = False
+    servers: list[PlexServer] = field(default_factory=list)
+
+
+@dataclass
 class AllSettings:
     """Complete application settings."""
 
@@ -394,6 +421,7 @@ class AllSettings:
     emby: EmbySettings = field(default_factory=EmbySettings)
     jellyfin: JellyfinSettings = field(default_factory=JellyfinSettings)
     channelsdvr: ChannelsDVRSettings = field(default_factory=ChannelsDVRSettings)
+    plex: PlexSettings = field(default_factory=PlexSettings)
     proxy: ProxySettings = field(default_factory=ProxySettings)
     epg_generation_counter: int = 0
     schema_version: int = 52

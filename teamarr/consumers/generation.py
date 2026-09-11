@@ -18,6 +18,7 @@ from teamarr.dispatcharr.factory import DispatcharrConnection
 from teamarr.dispatcharr.managers import ChannelManager
 from teamarr.emby.client import EmbyClient
 from teamarr.jellyfin.client import JellyfinClient
+from teamarr.plex.client import PlexClient, compute_channelmap_update
 from teamarr.services import create_default_service
 from teamarr.services.sports_data import flush_shared_cache
 from teamarr.services.stream_ordering import StreamOrderingService
@@ -74,6 +75,7 @@ class GenerationResult:
     jellyfin_refresh: dict = field(default_factory=dict)
     channelsdvr_refresh: dict = field(default_factory=dict)
     channelsdvr_epg_refresh: dict = field(default_factory=dict)
+    plex_refresh: dict = field(default_factory=dict)
     # One entry per media server refreshed this run (#649): persisted on the
     # run row so a server that fails every run is visible after the fact.
     media_server_outcomes: list[dict] = field(default_factory=list)
@@ -457,9 +459,9 @@ def run_full_generation(
             )
         timer.mark("dispatcharr_epg_refresh")
 
-        # Steps 5b-5d: media-server guide refreshes — Emby, Jellyfin, and
-        # Channels DVR servers ALL refresh in parallel (#471). They are
-        # independent HTTP targets; per-server failures are isolated and
+        # Steps 5b-5d: media-server guide refreshes — Emby, Jellyfin,
+        # Channels DVR, and Plex servers ALL refresh in parallel (#471). They
+        # are independent HTTP targets; per-server failures are isolated and
         # non-blocking, and one slow/offline server never delays the rest.
         check_cancelled()
         try:
@@ -467,12 +469,14 @@ def run_full_generation(
                 get_channelsdvr_settings,
                 get_emby_settings,
                 get_jellyfin_settings,
+                get_plex_settings,
             )
 
             with db_factory() as conn:
                 emby_settings = get_emby_settings(conn)
                 jellyfin_settings = get_jellyfin_settings(conn)
                 channelsdvr_settings = get_channelsdvr_settings(conn)
+                plex_settings = get_plex_settings(conn)
 
             jobs: list[tuple[str, Any]] = []
             if emby_settings.enabled:
@@ -481,6 +485,12 @@ def run_full_generation(
                 jobs += [("jellyfin", s) for s in jellyfin_settings.servers if s.url]
             if channelsdvr_settings.enabled:
                 jobs += [("channelsdvr", s) for s in channelsdvr_settings.servers if s.url]
+            if plex_settings.enabled:
+                jobs += [
+                    ("plex", s)
+                    for s in plex_settings.servers
+                    if s.url and s.token and s.dvr_id and s.device_key
+                ]
 
             if jobs and _dry_run_media_refresh(result, jobs):
                 jobs = []
@@ -490,7 +500,7 @@ def run_full_generation(
                     f"Refreshing {len(jobs)} media server(s) in parallel...",
                 )
                 outcomes = _run_media_server_refreshes(
-                    jobs, update_progress, is_cancellation_requested
+                    jobs, update_progress, is_cancellation_requested, db_factory
                 )
                 result.media_server_outcomes = [
                     _media_server_outcome(kind, label, o) for kind, label, o in outcomes
@@ -537,6 +547,17 @@ def run_full_generation(
                     result.channelsdvr_epg_refresh = {
                         "success": all(r.get("success") for r in cdvr_epg),
                         "servers": cdvr_epg,
+                    }
+
+                plex_results = [
+                    {"server": label, **o["guide"]}
+                    for kind, label, o in outcomes
+                    if kind == "plex" and o.get("guide") is not None
+                ]
+                if plex_results:
+                    result.plex_refresh = {
+                        "success": all(r.get("success") for r in plex_results),
+                        "servers": plex_results,
                     }
         except Exception as e:
             logger.warning("[MEDIA_SERVERS] Refresh failed (non-blocking): %s", e)
@@ -689,6 +710,8 @@ def _dry_run_media_refresh(result: Any, jobs: list[tuple[str, Any]]) -> bool:
         elif kind == "channelsdvr":
             result.channelsdvr_refresh = payload
             result.channelsdvr_epg_refresh = dict(payload)
+        elif kind == "plex":
+            result.plex_refresh = payload
     return True
 
 
@@ -696,13 +719,14 @@ def _run_media_server_refreshes(
     jobs: list[tuple[str, Any]],
     update_progress: Callable[..., None],
     is_cancellation_requested: Callable[[], bool],
+    db_factory: Callable[[], Any],
 ) -> list[tuple[str, str, dict]]:
     """Run every media-server refresh job concurrently (#471).
 
-    Each job is (kind, server) with kind in emby/jellyfin/channelsdvr.
+    Each job is (kind, server) with kind in emby/jellyfin/channelsdvr/plex.
     Returns (kind, label, outcome) triples where outcome carries "guide"
-    (Emby/Jellyfin) or "m3u"/"epg" (Channels DVR) result dicts. A job that
-    raises yields a failed "guide" outcome — never an exception.
+    (Emby/Jellyfin/Plex) or "m3u"/"epg" (Channels DVR) result dicts. A job
+    that raises yields a failed "guide" outcome — never an exception.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -717,6 +741,7 @@ def _run_media_server_refreshes(
                 server,
                 update_progress,
                 is_cancellation_requested,
+                db_factory,
             ): (kind, server)
             for kind, server in jobs
         }
@@ -759,6 +784,7 @@ def _refresh_one_media_server(
     server: Any,
     update_progress: Callable[..., None],
     is_cancellation_requested: Callable[[], bool],
+    db_factory: Callable[[], Any],
 ) -> dict:
     """Refresh a single media server (runs on a worker thread)."""
     label = server.name or server.url or ""
@@ -770,6 +796,15 @@ def _refresh_one_media_server(
             lambda msg: update_progress("channelsdvr", 97, f"{msg} ({label})"),
         )
         return {"m3u": m3u_res, "epg": epg_res}
+
+    if kind == "plex":
+        guide_res = _refresh_plex_server(
+            server,
+            label,
+            db_factory,
+            lambda msg: update_progress("plex", 97, f"{msg} ({label})"),
+        )
+        return {"guide": guide_res}
 
     title = "Emby" if kind == "emby" else "Jellyfin"
     client_cls = EmbyClient if kind == "emby" else JellyfinClient
@@ -905,6 +940,89 @@ def _refresh_channelsdvr_server(
         )
 
     return m3u_result, epg_result
+
+
+def _refresh_plex_server(
+    server: Any,
+    label: str,
+    db_factory: Callable[[], Any],
+    progress: Callable[[str], None],
+) -> dict:
+    """Reload one Plex server's guide, then push Teamarr's current channels.
+
+    Guide reload runs first — a channel can't be enabled via channelmap
+    without guide data bound to it (see PR brief). The channelmap step is
+    fetch-merge-write: read the device's current state, preserve every
+    enabled channel outside Teamarr's own number range (other tools/manual
+    entries sharing the device), and set the full desired list — Plex's
+    channelmap endpoint is a full-state-replace, never a delta.
+
+    Requires dvr_id + device_key already selected in Settings; callers
+    filter those servers into the job list before this runs.
+    """
+    from teamarr.database.settings import get_lifecycle_settings
+
+    client = PlexClient(base_url=server.url, token=server.token or "")
+
+    progress("Reloading Plex guide...")
+    guide_result = client.reload_guide(server.dvr_id)
+    if not guide_result.get("success"):
+        logger.warning("[PLEX] %s: guide reload failed: %s", label, guide_result.get("error"))
+        return guide_result
+    logger.info("[PLEX] %s: guide reload triggered", label)
+
+    dvrs_result = client.list_dvrs()
+    if not dvrs_result.get("success"):
+        logger.warning(
+            "[PLEX] %s: could not read DVR/device state: %s", label, dvrs_result.get("error")
+        )
+        return dvrs_result
+
+    device = next(
+        (d for dvr in dvrs_result["dvrs"] for d in dvr.devices if d.key == server.device_key),
+        None,
+    )
+    if device is None:
+        logger.warning(
+            "[PLEX] %s: configured device %s no longer found on server",
+            label,
+            server.device_key,
+        )
+        return {"success": False, "error": "Configured device not found"}
+
+    with db_factory() as conn:
+        lifecycle = get_lifecycle_settings(conn)
+        rows = conn.execute(
+            """SELECT channel_number FROM managed_channels
+               WHERE deleted_at IS NULL AND channel_number IS NOT NULL"""
+        ).fetchall()
+
+    teamarr_keys: set[str] = set()
+    for row in rows:
+        try:
+            teamarr_keys.add(str(int(float(row["channel_number"]))))
+        except (TypeError, ValueError):
+            continue
+
+    channel_range = (lifecycle.channel_range_start, lifecycle.channel_range_end)
+    enabled, mapping = compute_channelmap_update(
+        device.channel_mapping, teamarr_keys, channel_range
+    )
+
+    progress("Updating Plex channel map...")
+    map_result = client.update_channelmap(device.key, enabled, mapping)
+    if map_result.get("success"):
+        logger.info(
+            "[PLEX] %s: channel map updated (%d channels enabled, %d Teamarr-managed)",
+            label,
+            len(enabled),
+            len(teamarr_keys),
+        )
+    else:
+        logger.warning(
+            "[PLEX] %s: channel map update failed: %s", label, map_result.get("error")
+        )
+    return map_result
 
 
 def _refresh_m3u_accounts(db_factory: Callable[[], Any], dispatcharr_client: Any) -> dict:

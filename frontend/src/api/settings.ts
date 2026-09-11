@@ -311,6 +311,48 @@ export interface ChannelsDVRLineupsResponse {
   error?: string | null
 }
 
+// One Plex Media Server target. Token round-trips masked ("********") for
+// untouched rows; the backend merges the stored value back.
+export interface PlexServer {
+  name: string
+  url: string | null
+  token: string | null
+  dvr_id: string | null
+  device_key: string | null
+}
+
+export interface PlexSettings {
+  enabled: boolean
+  // Full-replace on update: send the complete list
+  servers: PlexServer[]
+}
+
+export interface PlexTestResponse {
+  success: boolean
+  dvr_count?: number | null
+  error?: string | null
+}
+
+export interface PlexDevice {
+  key: string
+  device_id: string | null
+  uri: string | null
+  profile_hint: string | null
+  channel_count: number
+}
+
+export interface PlexDvr {
+  key: string
+  lineup_title: string | null
+  devices: PlexDevice[]
+}
+
+export interface PlexDvrsResponse {
+  success: boolean
+  dvrs: PlexDvr[]
+  error?: string | null
+}
+
 export interface AllSettings {
   dispatcharr: DispatcharrSettings
   lifecycle: LifecycleSettings
@@ -327,6 +369,7 @@ export interface AllSettings {
   emby?: EmbySettings
   jellyfin?: JellyfinSettings
   channelsdvr?: ChannelsDVRSettings
+  plex?: PlexSettings
   proxy?: ProxySettings
   epg_generation_counter: number
   schema_version: number
@@ -646,6 +689,27 @@ export async function getChannelsDVRSources(url?: string): Promise<ChannelsDVRSo
 export async function getChannelsDVRLineups(url?: string): Promise<ChannelsDVRLineupsResponse> {
   const qs = url ? `?url=${encodeURIComponent(url)}` : ""
   return api.get(`/channelsdvr/lineups${qs}`)
+}
+
+// Plex Settings API
+export async function getPlexSettings(): Promise<PlexSettings> {
+  return api.get("/settings/plex")
+}
+
+export async function updatePlexSettings(data: Partial<PlexSettings>): Promise<PlexSettings> {
+  return api.put("/settings/plex", data)
+}
+
+export async function testPlexConnection(data?: { url?: string; token?: string }): Promise<PlexTestResponse> {
+  return api.post("/plex/test", data || {})
+}
+
+export async function getPlexDvrs(url?: string, token?: string): Promise<PlexDvrsResponse> {
+  const params = new URLSearchParams()
+  if (url) params.set("url", url)
+  if (token) params.set("token", token)
+  const qs = params.toString() ? `?${params.toString()}` : ""
+  return api.get(`/plex/dvrs${qs}`)
 }
 
 // Provider Proxy Settings API
