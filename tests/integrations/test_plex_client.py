@@ -19,6 +19,7 @@ from teamarr.plex.client import (
     PlexChannelMapping,
     PlexClient,
     PlexDevice,
+    channelmap_needs_update,
     compute_channelmap_update,
 )
 
@@ -230,11 +231,10 @@ class TestComputeChannelmapUpdate:
             current, teamarr_channel_keys={"101", "102"}, teamarr_range=(101, 200)
         )
 
+        # Foreign channels stay enabled but get NO mapping param — see
+        # test_foreign_channels_never_get_a_mapping_param for why.
         assert set(enabled) == {"60", "90", "101", "102"}
-        assert mapping["60"] == "60"
-        assert mapping["90"] == "90"
-        assert mapping["101"] == "101"
-        assert mapping["102"] == "102"
+        assert mapping == {"101": "101", "102": "102"}
 
     def test_disabled_non_teamarr_channels_stay_disabled(self):
         current = [
@@ -263,7 +263,8 @@ class TestComputeChannelmapUpdate:
     def test_root_scoped_device_no_range_preserves_nothing_owned(self):
         """No range configured means nothing is recognized as Teamarr's own
         (defensive default) — every enabled channel from another tool is
-        still preserved since none are (falsely) claimed as Teamarr range."""
+        still preserved (enabled, no mapping param) since none are (falsely)
+        claimed as Teamarr range."""
         current = [
             PlexChannelMapping(device_identifier="5", enabled=True, lineup_identifier="5"),
         ]
@@ -271,7 +272,7 @@ class TestComputeChannelmapUpdate:
             current, teamarr_channel_keys={"101"}, teamarr_range=None
         )
         assert set(enabled) == {"5", "101"}
-        assert mapping["5"] == "5"
+        assert mapping == {"101": "101"}
 
     def test_unbounded_range_end_none(self):
         current = [
@@ -294,10 +295,14 @@ class TestComputeChannelmapUpdate:
         )
         assert enabled == ["abc"]
 
-    def test_preserved_channel_keeps_its_own_epg_binding(self):
-        """A foreign channel's EPG match may differ from its channel number
-        (Plex's Channel Matching UI allows remapping) — the preserved
-        mapping must carry that real binding forward, not force identity."""
+    def test_foreign_channels_never_get_a_mapping_param(self):
+        """A foreign channel's EPG binding is already correct in Plex —
+        resending it (even unchanged) was observed on a live server to make
+        Plex re-process and transiently clear that channel's cached guide
+        data (2026-09-12). Foreign channels must stay enabled but get no
+        channelMappingByKey/channelMapping param at all, regardless of
+        whether their lineup_identifier happens to differ from their
+        device_identifier (Plex's Channel Matching UI allows remapping)."""
         current = [
             PlexChannelMapping(
                 device_identifier="700", enabled=True, lineup_identifier="101"
@@ -307,10 +312,49 @@ class TestComputeChannelmapUpdate:
             current, teamarr_channel_keys=set(), teamarr_range=(101, 200)
         )
         assert enabled == ["700"]
-        assert mapping["700"] == "101"
+        assert mapping == {}
 
     @pytest.mark.parametrize("range_", [(101, 200), (101, None), None])
     def test_never_raises_on_empty_current(self, range_):
         enabled, mapping = compute_channelmap_update([], {"101"}, range_)
         assert enabled == ["101"]
         assert mapping == {"101": "101"}
+
+
+class TestChannelmapNeedsUpdate:
+    """Skip the PUT (and its guide-refresh side effect) when nothing changed."""
+
+    def test_no_change_returns_false(self):
+        current = [
+            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
+            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
+        ]
+        assert channelmap_needs_update(current, ["60", "101"], {"101": "101"}) is False
+
+    def test_new_teamarr_channel_returns_true(self):
+        current = [
+            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
+        ]
+        assert channelmap_needs_update(current, ["60", "101"], {"101": "101"}) is True
+
+    def test_removed_teamarr_channel_returns_true(self):
+        current = [
+            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
+            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
+        ]
+        assert channelmap_needs_update(current, ["60"], {}) is True
+
+    def test_changed_lineup_identifier_returns_true(self):
+        current = [
+            PlexChannelMapping(device_identifier="101", enabled=False, lineup_identifier="101"),
+        ]
+        assert channelmap_needs_update(current, ["101"], {"101": "101"}) is True
+
+    def test_foreign_channel_drift_returns_true(self):
+        """A foreign channel disappearing/appearing changes the enabled
+        set even though it's never in `channel_mapping`."""
+        current = [
+            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
+            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
+        ]
+        assert channelmap_needs_update(current, ["101"], {"101": "101"}) is True

@@ -767,7 +767,7 @@ function PlexServerRow({ index, server, onChange, onRemove, removable }: PlexSer
                 </option>
                 {devices.map(({ dvr, device }) => (
                   <option key={`${dvr.key}::${device.key}`} value={`${dvr.key}::${device.key}`}>
-                    {dvr.lineup_title || `DVR ${dvr.key}`} — {device.profile_hint || device.uri || device.key}
+                    {device.profile_hint || device.uri || device.key}
                     {" "}({device.channel_count} enabled)
                   </option>
                 ))}
