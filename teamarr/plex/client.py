@@ -7,16 +7,17 @@ each Teamarr generation:
 * ``POST /livetv/dvrs/<dvr_id>/reloadGuide`` — refreshes programme/EPG data
   for channels Plex already knows about. Does NOT add new channels.
 * ``PUT /media/grabbers/devices/<device_key>/channelmap`` — the enable/EPG-bind
-  call. Its ``channelsEnabled`` param is a **full-state-replace**, not
-  additive: an integration that PUTs only its own channels would silently
-  disable every other channel on that device (other tools, manually-added
-  channels, etc.) — see ``compute_channelmap_update``, which keeps every
-  channel outside Teamarr's own channel-number range enabled. The
-  per-channel ``channelMappingByKey``/``channelMapping`` params are the
-  OPPOSITE — never full-state: only Teamarr's own channels belong there.
-  Including an already-correct foreign channel's binding (even unchanged)
-  was observed on a live server to make Plex re-process and transiently
-  clear that channel's cached guide data (2026-09-12).
+  call. This is a **full-state-replace**, not additive, and that applies to
+  BOTH ``channelsEnabled`` and the per-channel ``channelMappingByKey``/
+  ``channelMapping`` params: a channel present in ``channelsEnabled`` but
+  missing its own mapping entry gets disabled anyway (confirmed on a live
+  server, 2026-09-12) — omitting "unchanged" channels from the mapping to
+  avoid resending them is NOT safe, despite looking like a harmless delta.
+  An integration that PUTs only its own channels' mapping would therefore
+  silently disable every other channel on that device (other tools,
+  manually-added channels, etc.) — see ``compute_channelmap_update``, which
+  resubmits every enabled channel outside Teamarr's own channel-number
+  range with its own current, unchanged binding.
 
 Both endpoints require ``X-Plex-Token`` (sent as a header here) — no other
 auth scheme. ``GET /livetv/dvrs`` is the read side: it returns every DVR and
@@ -138,14 +139,13 @@ def compute_channelmap_update(
     currently-matched EPG guide channel — see module docstring).
 
     Returns ``(enabled_channel_keys, channel_mapping)`` ready for
-    ``PlexClient.update_channelmap``. ``channel_mapping`` (which drives the
-    ``channelMappingByKey``/``channelMapping`` PUT params) covers ONLY
-    Teamarr's own channels — a preserved foreign channel's binding is
-    already correct in Plex, and re-submitting it (even with an identical,
-    unchanged value) was observed on a live server to make Plex
-    re-process and transiently clear that channel's cached guide data
-    (2026-09-12). Foreign channels are kept enabled via
-    ``enabled_channel_keys`` only, never touched via a mapping param.
+    ``PlexClient.update_channelmap``. ``channel_mapping`` MUST cover every
+    enabled channel on the device (preserved foreign ones too), not just
+    Teamarr's own — live testing (2026-09-12) showed a channel present in
+    ``channelsEnabled`` but absent from ``channelMappingByKey``/
+    ``channelMapping`` gets disabled anyway, i.e. this is not the delta it
+    looks like; a preserved channel's own current ``lineup_identifier`` is
+    resubmitted unchanged, never overwritten.
     """
 
     def _owned_by_teamarr(device_identifier: str) -> bool:
@@ -164,10 +164,13 @@ def compute_channelmap_update(
         m for m in current if m.enabled and not _owned_by_teamarr(m.device_identifier)
     ]
 
-    enabled_keys = {m.device_identifier for m in preserved} | set(teamarr_channel_keys)
-    enabled = sorted(enabled_keys, key=_channel_sort_key)
+    mapping: dict[str, str] = {
+        m.device_identifier: m.lineup_identifier or m.device_identifier for m in preserved
+    }
+    for key in teamarr_channel_keys:
+        mapping[key] = key
 
-    mapping: dict[str, str] = {key: key for key in teamarr_channel_keys}
+    enabled = sorted(mapping, key=_channel_sort_key)
     return enabled, mapping
 
 
@@ -293,15 +296,13 @@ class PlexClient:
     ) -> dict:
         """PUT /media/grabbers/devices/<device_key>/channelmap — enable + EPG-bind.
 
-        Full-state-replace on ``enabled_channel_keys``: it must be the
-        COMPLETE desired enabled set (see ``compute_channelmap_update``),
-        not a delta — anything omitted gets disabled. ``channel_mapping``
-        is intentionally NOT full-state: it must contain ONLY the channels
-        whose guide binding actually needs (re)asserting (Teamarr's own).
-        Including an already-correct foreign channel's binding here — even
-        with its own unchanged value — was observed on a live server to
-        make Plex re-process and transiently clear that channel's cached
-        guide data.
+        Full-state-replace, and NOT just on ``enabled_channel_keys``:
+        ``channel_mapping`` must ALSO cover every enabled channel (see
+        ``compute_channelmap_update``) — a channel present in
+        ``channelsEnabled`` but missing its own mapping entry gets disabled
+        anyway (confirmed on a live server, 2026-09-12). There is no safe
+        delta here; every enabled channel's binding must be resubmitted
+        every time, even unchanged.
         """
         params: list[tuple[str, str]] = [
             ("channelsEnabled", ",".join(enabled_channel_keys)),
