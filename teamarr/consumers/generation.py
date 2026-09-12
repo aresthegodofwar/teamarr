@@ -19,7 +19,7 @@ from teamarr.dispatcharr.factory import DispatcharrConnection
 from teamarr.dispatcharr.managers import ChannelManager
 from teamarr.emby.client import EmbyClient
 from teamarr.jellyfin.client import JellyfinClient
-from teamarr.plex.client import PlexClient, channelmap_needs_update, compute_channelmap_update
+from teamarr.plex.client import PlexClient, compute_channelmap_update
 from teamarr.services import create_default_service
 from teamarr.services.sports_data import flush_shared_cache
 from teamarr.services.stream_ordering import StreamOrderingService
@@ -27,35 +27,6 @@ from teamarr.utilities import call_metrics
 from teamarr.utilities.xmltv import merge_xmltv_content
 
 logger = logging.getLogger(__name__)
-
-# Settle time between the Plex channelmap PUT and the explicit guide reload
-# (see _refresh_plex_server). Untested heuristic, not a documented Plex
-# requirement — enabling+mapping a channel appears to trigger its own guide
-# pull already; this delay is for the explicit reload to pick up programme
-# changes on already-known channels without racing the channelmap's own
-# processing. Tune based on further live-server testing.
-_PLEX_GUIDE_RELOAD_DELAY_SECONDS = 3
-
-# Minimum gap enforced between two guide-refresh triggers (channelmap's own
-# side-effect refresh or an explicit reloadGuide call) for the same DVR —
-# in-process only, reset on restart. Prevents back-to-back generation runs
-# (or a channelmap-triggered refresh immediately followed by our own
-# explicit reload) from hammering Plex's guide processing twice in quick
-# succession.
-_PLEX_GUIDE_REFRESH_COOLDOWN_SECONDS = 60
-_plex_guide_last_touched: dict[str, float] = {}
-_plex_guide_touch_lock = threading.Lock()
-
-
-def _plex_guide_recently_touched(dvr_id: str) -> bool:
-    with _plex_guide_touch_lock:
-        last = _plex_guide_last_touched.get(dvr_id)
-    return last is not None and (time.monotonic() - last) < _PLEX_GUIDE_REFRESH_COOLDOWN_SECONDS
-
-
-def _mark_plex_guide_touched(dvr_id: str) -> None:
-    with _plex_guide_touch_lock:
-        _plex_guide_last_touched[dvr_id] = time.monotonic()
 
 
 class GenerationCancelled(Exception):
@@ -994,26 +965,20 @@ def _refresh_plex_server(
     progress: Callable[[str], None],
     is_cancellation_requested: Callable[[], bool],
 ) -> dict:
-    """Push Teamarr's current channels, then reload the guide once they're live.
+    """Push Teamarr's current channels into the device's channelmap.
 
-    Channelmap runs FIRST: a channel can't have guide data bound to it via
-    reloadGuide until Plex actually knows it's enabled (2026-09-12 live
-    testing — the reverse order left brand-new channels with no EPG data,
-    and separately corrupted already-correct foreign channels' guide data,
-    see ``compute_channelmap_update``/``update_channelmap`` docstrings for
-    the second issue). After a settle delay, reloadGuide re-processes the
-    guide now that the new channels are enabled. This ordering is itself
-    an untested heuristic — Plex exposes no documentation for either call.
-
-    The channelmap PUT is skipped entirely when nothing would actually
-    change (``channelmap_needs_update``) — enabling/mapping a channel
-    appears to trigger Plex's own guide refresh as a side effect, so an
-    unconditional PUT every run would double-trigger a refresh on top of
-    the explicit ``reloadGuide`` below. That explicit reload is itself
-    gated by a cooldown (``_plex_guide_recently_touched``) shared across
-    generation runs for the same DVR, so a channelmap-triggered refresh
-    and this call — or two runs in quick succession — can't fire twice in
-    a row too fast.
+    The channelmap PUT is the only call needed (2026-09-12 live testing):
+    it's what Plex's own UI sends when you open a tuner's Channel Matching
+    screen and hit Save with no changes, and doing so triggers a full guide
+    refresh on its own. An earlier version of this function also called the
+    separate ``reloadGuide`` endpoint, on the assumption it would refresh
+    programme data — live testing showed it does not reliably do that
+    (a channel reassigned to a different event kept showing stale guide
+    data through several ``reloadGuide`` calls), so it's been removed along
+    with the skip-if-unchanged/cooldown logic that existed only to avoid
+    double-triggering it. The channelmap PUT always runs, unconditionally,
+    every generation run — matching the manual "open device, hit Save"
+    behavior exactly.
 
     Callers only filter on `server.url` (matching Emby/Jellyfin/Channels DVR);
     a missing dvr_id/device_key is reported here as a visible failure rather
@@ -1090,46 +1055,20 @@ def _refresh_plex_server(
     if result := cancelled():
         return result
 
-    channelmap_changed = channelmap_needs_update(device.channel_mapping, enabled, mapping)
-    if channelmap_changed:
-        progress("Updating Plex channel map...")
-        map_result = client.update_channelmap(device.key, enabled, mapping)
-        if not map_result.get("success"):
-            logger.warning(
-                "[PLEX] %s: channel map update failed: %s", label, map_result.get("error")
-            )
-            return map_result
+    progress("Updating Plex channel map...")
+    map_result = client.update_channelmap(device.key, enabled, mapping)
+    if map_result.get("success"):
         logger.info(
             "[PLEX] %s: channel map updated (%d channels enabled, %d Teamarr-managed)",
             label,
             len(enabled),
             len(teamarr_keys),
         )
-        _mark_plex_guide_touched(server.dvr_id)
     else:
-        map_result = {"success": True}
-        logger.info("[PLEX] %s: channel map already up to date, skipping PUT", label)
-
-    if result := cancelled():
-        return result
-
-    if _plex_guide_recently_touched(server.dvr_id):
-        logger.info(
-            "[PLEX] %s: guide recently refreshed, skipping explicit reload", label
+        logger.warning(
+            "[PLEX] %s: channel map update failed: %s", label, map_result.get("error")
         )
-        return map_result
-
-    if channelmap_changed:
-        time.sleep(_PLEX_GUIDE_RELOAD_DELAY_SECONDS)
-
-    progress("Reloading Plex guide...")
-    guide_result = client.reload_guide(server.dvr_id)
-    if guide_result.get("success"):
-        logger.info("[PLEX] %s: guide reload triggered", label)
-        _mark_plex_guide_touched(server.dvr_id)
-    else:
-        logger.warning("[PLEX] %s: guide reload failed: %s", label, guide_result.get("error"))
-    return guide_result
+    return map_result
 
 
 def _refresh_m3u_accounts(db_factory: Callable[[], Any], dispatcharr_client: Any) -> dict:

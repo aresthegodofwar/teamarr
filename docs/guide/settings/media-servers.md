@@ -43,14 +43,13 @@ Times shown inside programme titles/descriptions come from your templates and re
 
 ## Plex
 
-Plex's Live TV & DVR feature (pointed at Dispatcharr's HDHomeRun emulation) doesn't notice new or removed channels on its own — after each generation Teamarr makes two calls per configured server:
-
-1. **Reload the guide** (`POST /livetv/dvrs/<id>/reloadGuide`) — refreshes programme data for channels Plex already knows about. This alone does not add new channels.
-2. **Update the channel map** (`PUT /media/grabbers/devices/<key>/channelmap`) — enables/disables channels on the matched device and binds each to its EPG data. This call is a **full-state-replace**: Teamarr first reads the device's current state (`GET /livetv/dvrs`), then writes back every currently-enabled channel that isn't one of Teamarr's own (so other tools or manually-added channels sharing the same device are never touched) plus Teamarr's current channel set.
+Plex's Live TV & DVR feature (pointed at Dispatcharr's HDHomeRun emulation) doesn't notice new or removed channels on its own — after each generation Teamarr updates the channel map (`PUT /media/grabbers/devices/<key>/channelmap`): it enables/disables channels on the matched device and binds each to its EPG data. This call is a **full-state-replace** — and not just for which channels are enabled: Teamarr first reads the device's current state (`GET /livetv/dvrs`), then writes back every currently-enabled channel's binding, including ones that aren't Teamarr's own (so other tools or manually-added channels sharing the same device keep their EPG data — a channel merely left out of the write gets disabled anyway), plus Teamarr's current channel set. This single call is also what refreshes Plex's guide data — it's the same request Plex's own UI sends when you open a tuner's Channel Matching screen and hit Save.
 
 ### Setup
 
 Each server entry needs a **URL**, a **Plex Token** ([finding your token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)), and a **DVR / Device** selection. Once the URL and token are set, Teamarr discovers every DVR and its HDHomeRun devices from the server and lists them in the dropdown — pick the one whose URI matches the Dispatcharr HDHomeRun instance/profile this server should track. A device whose URI has no profile suffix (e.g. plain `/hdhr`) pulls channels from *every* Dispatcharr profile on that instance; only pick it if that's actually what you want, since the channel-map merge then has to distinguish Teamarr's channels from everyone else's on a much larger shared set.
+
+If the device is scoped to one Dispatcharr profile, also pick that profile from the **Dispatcharr Channel Profile** dropdown — this limits which of Teamarr's managed channels get pushed to that device instead of pushing every profile's channels to it.
 
 {: .note }
 Teamarr assumes Dispatcharr/XMLTV numbering is aligned — that a tuner channel number and its XMLTV channel id match (Teamarr's documented default setup). Under that assumption no extra EPG-identifier lookup is needed; each of Teamarr's channels binds to itself in the channel map.

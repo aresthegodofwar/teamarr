@@ -19,7 +19,6 @@ from teamarr.plex.client import (
     PlexChannelMapping,
     PlexClient,
     PlexDevice,
-    channelmap_needs_update,
     compute_channelmap_update,
 )
 
@@ -151,24 +150,6 @@ class TestListDvrsHTTP:
 
         assert result["success"] is False
         assert "token" in result["error"].lower()
-
-
-class TestReloadGuide:
-    def test_posts_to_reload_guide_path(self, monkeypatch):
-        captured = {}
-
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            req = httpx.Request("POST", url)
-            return httpx.Response(200, request=req)
-
-        monkeypatch.setattr(httpx, "post", fake_post)
-
-        client = PlexClient(base_url="http://plex:32400", token="abc")
-        result = client.reload_guide("52")
-
-        assert result["success"] is True
-        assert captured["url"] == "http://plex:32400/livetv/dvrs/52/reloadGuide"
 
 
 class TestUpdateChannelmap:
@@ -319,42 +300,3 @@ class TestComputeChannelmapUpdate:
         enabled, mapping = compute_channelmap_update([], {"101"}, range_)
         assert enabled == ["101"]
         assert mapping == {"101": "101"}
-
-
-class TestChannelmapNeedsUpdate:
-    """Skip the PUT (and its guide-refresh side effect) when nothing changed."""
-
-    def test_no_change_returns_false(self):
-        current = [
-            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
-            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
-        ]
-        assert channelmap_needs_update(current, ["60", "101"], {"101": "101"}) is False
-
-    def test_new_teamarr_channel_returns_true(self):
-        current = [
-            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
-        ]
-        assert channelmap_needs_update(current, ["60", "101"], {"101": "101"}) is True
-
-    def test_removed_teamarr_channel_returns_true(self):
-        current = [
-            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
-            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
-        ]
-        assert channelmap_needs_update(current, ["60"], {}) is True
-
-    def test_changed_lineup_identifier_returns_true(self):
-        current = [
-            PlexChannelMapping(device_identifier="101", enabled=False, lineup_identifier="101"),
-        ]
-        assert channelmap_needs_update(current, ["101"], {"101": "101"}) is True
-
-    def test_foreign_channel_drift_returns_true(self):
-        """A foreign channel disappearing/appearing changes the enabled
-        set even though it's never in `channel_mapping`."""
-        current = [
-            PlexChannelMapping(device_identifier="60", enabled=True, lineup_identifier="60"),
-            PlexChannelMapping(device_identifier="101", enabled=True, lineup_identifier="101"),
-        ]
-        assert channelmap_needs_update(current, ["101"], {"101": "101"}) is True

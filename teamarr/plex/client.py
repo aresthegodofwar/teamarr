@@ -1,25 +1,32 @@
-"""Plex Media Server client for Live TV guide + channel-map refresh.
+"""Plex Media Server client for Live TV channel-map refresh.
 
 Plex's Live TV & DVR feature (pointed at Dispatcharr's HDHomeRun emulation)
-does not notice new/removed channels on its own — two calls are needed after
+does not notice new/removed channels on its own. The fix is one call after
 each Teamarr generation:
 
-* ``POST /livetv/dvrs/<dvr_id>/reloadGuide`` — refreshes programme/EPG data
-  for channels Plex already knows about. Does NOT add new channels.
 * ``PUT /media/grabbers/devices/<device_key>/channelmap`` — the enable/EPG-bind
-  call. This is a **full-state-replace**, not additive, and that applies to
-  BOTH ``channelsEnabled`` and the per-channel ``channelMappingByKey``/
+  call. This is what Plex's own UI sends when you open a tuner's Channel
+  Matching screen and hit Save — even with no changes — and doing so
+  triggers a full guide refresh on Plex's side as an observed side effect
+  (2026-09-12 live testing). It's a **full-state-replace**, and that applies
+  to BOTH ``channelsEnabled`` and the per-channel ``channelMappingByKey``/
   ``channelMapping`` params: a channel present in ``channelsEnabled`` but
-  missing its own mapping entry gets disabled anyway (confirmed on a live
-  server, 2026-09-12) — omitting "unchanged" channels from the mapping to
-  avoid resending them is NOT safe, despite looking like a harmless delta.
-  An integration that PUTs only its own channels' mapping would therefore
-  silently disable every other channel on that device (other tools,
-  manually-added channels, etc.) — see ``compute_channelmap_update``, which
-  resubmits every enabled channel outside Teamarr's own channel-number
-  range with its own current, unchanged binding.
+  missing its own mapping entry gets disabled anyway — omitting "unchanged"
+  channels from the mapping to avoid resending them is NOT safe, despite
+  looking like a harmless delta. An integration that PUTs only its own
+  channels' mapping would therefore silently disable every other channel
+  on that device (other tools, manually-added channels, etc.) — see
+  ``compute_channelmap_update``, which resubmits every enabled channel
+  outside Teamarr's own channel-number range with its own current,
+  unchanged binding.
 
-Both endpoints require ``X-Plex-Token`` (sent as a header here) — no other
+  A separate ``POST /livetv/dvrs/<dvr_id>/reloadGuide`` endpoint exists and
+  was used here previously on the assumption it refreshes programme data —
+  live testing showed it does not reliably do that (a channel reassigned
+  to a different event kept showing stale guide data through several
+  ``reloadGuide`` calls). It's not used by this client.
+
+This endpoint requires ``X-Plex-Token`` (sent as a header here) — no other
 auth scheme. ``GET /livetv/dvrs`` is the read side: it returns every DVR and
 its attached HDHomeRun devices, each carrying its current ``ChannelMapping``
 (channelKey/enabled/lineupIdentifier/deviceIdentifier) — the fetch half of
@@ -174,31 +181,6 @@ def compute_channelmap_update(
     return enabled, mapping
 
 
-def channelmap_needs_update(
-    current: list[PlexChannelMapping],
-    enabled_channel_keys: list[str],
-    channel_mapping: dict[str, str],
-) -> bool:
-    """Whether the computed desired state actually differs from ``current``.
-
-    Callers should skip the channelmap PUT entirely when this is False —
-    enabling/mapping a channel appears to trigger Plex's own guide refresh
-    as a side effect (2026-09-12 live testing), so a needless PUT means a
-    needless guide re-process on every single generation run, not just
-    when something changed.
-    """
-    current_by_key = {m.device_identifier: m for m in current}
-    if {m.device_identifier for m in current if m.enabled} != set(enabled_channel_keys):
-        return True
-    for key, value in channel_mapping.items():
-        existing = current_by_key.get(key)
-        if existing is None or not existing.enabled:
-            return True
-        if (existing.lineup_identifier or existing.device_identifier) != value:
-            return True
-    return False
-
-
 class PlexClient:
     """Client for the Plex Media Server Live TV / DVR API."""
 
@@ -269,24 +251,6 @@ class PlexClient:
         if not result["success"]:
             return result
         return {"success": True, "dvr_count": len(result["dvrs"])}
-
-    def reload_guide(self, dvr_id: str) -> dict:
-        """POST /livetv/dvrs/<dvr_id>/reloadGuide — refresh programme data.
-
-        Does not add/remove channels — see ``update_channelmap`` for that.
-        """
-        try:
-            resp = httpx.post(
-                f"{self.base_url}/livetv/dvrs/{dvr_id}/reloadGuide",
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            return {"success": False, "error": f"HTTP {e.response.status_code}"}
-        except httpx.HTTPError as e:
-            return {"success": False, "error": str(e)}
-        return {"success": True}
 
     def update_channelmap(
         self,
